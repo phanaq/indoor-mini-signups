@@ -71,10 +71,10 @@ alter table public.mini_signups  enable row level security;
 alter table public.mini_feedback enable row level security;
 
 -- ── Seed the five Wednesdays ────────────────────────────────────────────────
-insert into public.mini_sessions (session_date) values
-    ('2026-11-18'),
-    ('2026-11-25'),
-    ('2026-12-02'),
-    ('2026-12-09'),
-    ('2026-12-16')
+insert into public.mini_sessions (session_date, capacity) values
+    ('2026-11-18', 12),
+    ('2026-11-25', 12),
+    ('2026-12-02', 12),
+    ('2026-12-09', 12),
+    ('2026-12-16', 12)
 on conflict (session_date) do nothing;

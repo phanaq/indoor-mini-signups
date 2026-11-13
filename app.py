@@ -30,6 +30,17 @@ PREFERENCES = {
 PAYMENT_METHODS = ["", "Venmo", "Zelle", "Cash", "PayPal", "Other"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+# Spot rules (by signup order within each gender match)
+WMP_GUARANTEED = 5   # first N WMP always get a spot, whatever the format
+MIXED_PER_SIDE = 5   # mixed: first N WMP + first N MMP
+WMP_ONLY_SPOTS = 10  # WMP-only: first N WMP
+SPOT_TEXT = {
+    "spot": "You have a spot",
+    "maybe": "Maybe: depends on whether this date ends up mixed or WMP-only",
+    "waitlist": "Waitlist",
+    "not_eligible": "This date is WMP-only",
+}
+
 st.set_page_config(page_title="Indoor Mini Signups", layout="centered")
 
 
@@ -93,6 +104,35 @@ def going(signups: list[dict], session_id: int) -> list[dict]:
     return [r for r in signups if r["session_id"] == session_id and r["status"] == "going"]
 
 
+def spot_status(s: dict, signups: list[dict]) -> dict[int, tuple[str, int | None]]:
+    """Map signup id -> (status, waitlist position) for one session.
+
+    TBD:   first 5 WMP have a spot; everyone else is a maybe.
+    Mixed: first 5 WMP and first 5 MMP have a spot; the rest are waitlisted.
+    WMP:   first 10 WMP have a spot; the rest are waitlisted; MMP not eligible.
+    """
+    roster = sorted(going(signups, s["id"]), key=lambda r: (r["created_at"], r["id"]))
+    out: dict[int, tuple[str, int | None]] = {}
+    for m in MATCHUPS:
+        side = [r for r in roster if r["matchup"] == m]
+        for rank, r in enumerate(side, start=1):
+            fmt = s["format"]
+            if fmt == "wmp" and m == "MMP":
+                out[r["id"]] = ("not_eligible", None)
+            elif fmt == "wmp":
+                out[r["id"]] = ("spot", None) if rank <= WMP_ONLY_SPOTS else ("waitlist", rank - WMP_ONLY_SPOTS)
+            elif fmt == "mixed":
+                out[r["id"]] = ("spot", None) if rank <= MIXED_PER_SIDE else ("waitlist", rank - MIXED_PER_SIDE)
+            else:  # tbd
+                out[r["id"]] = ("spot", None) if m == "WMP" and rank <= WMP_GUARANTEED else ("maybe", None)
+    return out
+
+
+def spot_label(status: tuple[str, int | None]) -> str:
+    kind, pos = status
+    return f"Waitlist #{pos}" if kind == "waitlist" else SPOT_TEXT[kind]
+
+
 def money(x) -> str:
     return f"${float(x or 0):,.2f}".replace(".00", "")
 
@@ -106,7 +146,12 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         "for each date is finalized.\n\n"
         "1-2 dates will be converted to WMP only mini based on availability. The other dates "
         "will be 2:2 mixed.\n\n"
-        "Suggested payment per session is $15 but pay what you can."
+        "Suggested payment per session is $15 but pay what you can.\n\n"
+        "**Spots:** each session is capped at 12 players, and spots go in signup order. "
+        f"The first {WMP_GUARANTEED} WMP always get a spot. On mixed dates, the first "
+        f"{MIXED_PER_SIDE} WMP and first {MIXED_PER_SIDE} MMP get a spot. On WMP-only dates, "
+        f"the first {WMP_ONLY_SPOTS} WMP get a spot. Until a date's format is set, everyone "
+        "else is a maybe."
     )
 
     email = st.text_input("Email", max_chars=120, placeholder="you@example.com").strip()
@@ -121,8 +166,6 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
     mine = {r["session_id"]: r for r in signups if r["player_key"] == key}
     my_fb = next((f for f in feedback if f["player_key"] == key), None)
     prev = next(iter(mine.values()), None)
-    if prev:
-        st.success(f"Welcome back, {prev['player_name']} — your signups are loaded below.")
 
     with st.form(f"signup-{key}"):
         name = st.text_input(
@@ -164,6 +207,9 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         submitted = st.form_submit_button("Save my signups", type="primary")
 
     if not submitted:
+        if st.session_state.pop("signups_saved", False):
+            st.success("Signups saved")
+        my_status(sessions, signups, mine)
         return
     if not name:
         st.error("Please enter your name.")
@@ -186,16 +232,17 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
             continue  # never touch past/cancelled sessions from the player side
         existing = mine.get(s["id"])
         if picks[s["id"]]:
-            upserts.append(
-                {
-                    "session_id": s["id"],
-                    "player_name": name,
-                    "player_key": key,
-                    "contact": email,
-                    "matchup": matchup,
-                    "status": "going",
-                }
-            )
+            row = {
+                "session_id": s["id"],
+                "player_name": name,
+                "player_key": key,
+                "contact": email,
+                "matchup": matchup,
+                "status": "going",
+            }
+            if existing and existing["status"] == "cancelled":
+                row["created_at"] = datetime.now(TZ).isoformat()  # re-joining goes to the back of the line
+            upserts.append(row)
         elif existing and existing["status"] == "going":
             cancels.append(existing["id"])
 
@@ -228,8 +275,21 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         on_conflict="player_key",
     ).execute()
     refresh()
-    n = len(upserts)
-    st.success(f"Saved! You're signed up for {n} date{'s' if n != 1 else ''}. See you on the court.")
+    st.session_state["signups_saved"] = True
+    st.rerun()  # reload so "Your spots" reflects the new signups
+
+
+def my_status(sessions: list[dict], signups: list[dict], mine: dict[int, dict]) -> None:
+    rows = []
+    for s in sessions:
+        r = mine.get(s["id"])
+        if not r or r["status"] != "going":
+            continue
+        status = spot_status(s, signups).get(r["id"], ("maybe", None))
+        rows.append(f"- **{session_label(s)}** ({format_badge(s)}): {spot_label(status)}")
+    if rows:
+        st.markdown("**Your spots**")
+        st.markdown("\n".join(rows))
 
 
 # ── Who's going tab ─────────────────────────────────────────────────────────
@@ -242,12 +302,21 @@ def roster_tab(sessions: list[dict], signups: list[dict]) -> None:
                 f"{format_badge(s)} · {len(roster)} going"
                 + (f" · {s['notes']}" if s["notes"] else "")
             )
+            status = spot_status(s, signups)
             cols = st.columns(2)
             for col, m in zip(cols, MATCHUPS):
-                names = sorted((r["player_name"] for r in roster if r["matchup"] == m), key=str.lower)
+                side = sorted(
+                    (r for r in roster if r["matchup"] == m), key=lambda r: (r["created_at"], r["id"])
+                )
+                lines = []
+                for r in side:
+                    kind, pos = status[r["id"]]
+                    tag = {"spot": "", "maybe": " (maybe)", "waitlist": f" (waitlist #{pos})",
+                           "not_eligible": " (WMP-only date)"}[kind]
+                    lines.append(f"- {r['player_name']}{tag}")
                 with col:
-                    st.markdown(f"**{m}: {len(names)}**")
-                    st.markdown("\n".join(f"- {n}" for n in names) if names else "_No one yet_")
+                    st.markdown(f"**{m}: {len(side)}**")
+                    st.markdown("\n".join(lines) if lines else "_No one yet_")
             if s["court_cost"] and roster:
                 st.caption(
                     f"Court cost {money(s['court_cost'])}, about "
@@ -343,6 +412,8 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
             ["id", "player_name", "contact", "matchup", "status", "is_walk_in",
              "attended", "paid", "amount_paid", "payment_method"]
         ]
+        st_map = spot_status(s, signups)
+        df.insert(2, "spot", df["id"].map(lambda i: spot_label(st_map[i]) if i in st_map else ""))
         df["contact"] = df["contact"].fillna("")
         df["amount_paid"] = df["amount_paid"].astype(float)
         df["payment_method"] = df["payment_method"].fillna("")
@@ -354,10 +425,11 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
             key=f"editor-{sid}",
             hide_index=True,
             width="stretch",
-            disabled=["id", "player_name", "contact", "is_walk_in"],
+            disabled=["id", "player_name", "spot", "contact", "is_walk_in"],
             column_config={
                 "id": None,
                 "player_name": "Player",
+                "spot": "Spot",
                 "contact": "Email",
                 "matchup": st.column_config.SelectboxColumn("Match", options=MATCHUPS),
                 "status": st.column_config.SelectboxColumn("Status", options=["going", "cancelled"]),
