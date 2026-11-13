@@ -22,8 +22,8 @@ create table if not exists public.mini_signups (
     id              bigint generated always as identity primary key,
     session_id      bigint      not null references public.mini_sessions(id) on delete cascade,
     player_name     text        not null,
-    player_key      text        not null,          -- lower(trim(name)), set by the app
-    contact         text,                           -- Slack handle / phone
+    player_key      text        not null,          -- lower-cased email (walk-ins without email: "walkin:<name>")
+    contact         text,                           -- email as typed
     matchup         text        not null
                     check (matchup in ('WMP', 'MMP', 'Either')),
     status          text        not null default 'going'
@@ -56,7 +56,7 @@ create trigger mini_signups_touch
 create table if not exists public.mini_feedback (
     id            bigint generated always as identity primary key,
     player_name   text        not null,
-    player_key    text        not null unique,
+    player_key    text        not null unique,   -- lower-cased email
     preference    text        not null
                   check (preference in ('mixed', 'wmp', 'some_of_each', 'no_preference')),
     comments      text,

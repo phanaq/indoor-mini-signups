@@ -17,8 +17,8 @@ A Streamlit app backed by its own Supabase project for Wednesday mini at ComEd (
 
 | Tab | Who | What |
 |---|---|---|
-| **Sign up** | everyone | Enter your name and matchup, check the dates you can make, and give feedback on mixed vs WMP-only. Entering the same name again loads your earlier answers so you can change them. |
-| **Who's going** | everyone | Each date's roster with WMP/MMP/Either counts, plus a per-person cost estimate once you set the court cost. |
+| **Sign up** | everyone | Enter your email, name and gender match (WMP or MMP), check the dates you can make, and give feedback on mixed vs WMP-only. Entering the same email again loads your earlier answers so you can change them. |
+| **Who's going** | everyone | Each date's names split into WMP and MMP, with the count for each, plus a per-person cost estimate once you set the court cost. |
 | **Admin** | you (password) | A format planner, a check-in sheet (here / paid / amount / Venmo-cash), walk-ins, each session's format, cap and cost, a season grid, a CSV export and a feedback tally. |
 
 - Players can't change a session after it starts (Chicago time).
@@ -31,7 +31,7 @@ A Streamlit app backed by its own Supabase project for Wednesday mini at ComEd (
 
 Mini is 4v4, so a playable night needs about **8 people, ideally 10–12** so there are subs. One hour is short and people will tire.
 
-- **A date can be WMP-only** if **≥ 8 WMP** signed up for it, counting "Either" players.
+- **A date can be WMP-only** if **≥ 8 WMP** signed up for it.
 - **A date should be mixed** if WMP is short of 8 but each side has at least 4.
 - **Below that**, recruit for the date, or move the date's players to the format that does fill.
 

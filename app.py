@@ -1,12 +1,16 @@
 """Indoor Mini signups — Streamlit + Supabase.
 
-Players sign up for the Wednesday mini dates they plan to attend.
-Payment is collected at each session (PWYC), and the admin tab is used
-as a check-in sheet to record attendance and who paid what.
+Players sign up with email, name and gender match (WMP/MMP) for the Wednesday
+mini dates they plan to attend. Payment is collected at each session (PWYC),
+and the admin tab is used as a check-in sheet to record attendance and payment.
+
+Storage notes: `player_key` holds the lower-cased email (the player's identity)
+and `contact` holds the email as typed.
 """
 from __future__ import annotations
 
 import hmac
+import re
 from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
@@ -16,8 +20,7 @@ from supabase import Client, create_client
 
 TZ = ZoneInfo("America/Chicago")
 FORMAT_LABELS = {"tbd": "Format TBD", "mixed": "Mixed", "wmp": "WMP only"}
-FORMAT_EMOJI = {"tbd": "❔", "mixed": "🔀", "wmp": "💜"}
-MATCHUPS = ["WMP", "MMP", "Either"]
+MATCHUPS = ["WMP", "MMP"]
 PREFERENCES = {
     "some_of_each": "Some mixed, some WMP-only",
     "mixed": "All mixed",
@@ -25,8 +28,9 @@ PREFERENCES = {
     "no_preference": "No preference",
 }
 PAYMENT_METHODS = ["", "Venmo", "Zelle", "Cash", "PayPal", "Other"]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-st.set_page_config(page_title="Indoor Mini Signups", page_icon="🥏", layout="centered")
+st.set_page_config(page_title="Indoor Mini Signups", layout="centered")
 
 
 # ── Supabase ────────────────────────────────────────────────────────────────
@@ -57,8 +61,8 @@ def refresh() -> None:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
-def player_key(name: str) -> str:
-    return " ".join(name.lower().split())
+def email_key(email: str) -> str:
+    return email.strip().lower()
 
 
 def session_start(s: dict) -> datetime:
@@ -82,9 +86,7 @@ def session_label(s: dict) -> str:
 
 
 def format_badge(s: dict) -> str:
-    if s["is_cancelled"]:
-        return "🚫 Cancelled"
-    return f"{FORMAT_EMOJI[s['format']]} {FORMAT_LABELS[s['format']]}"
+    return "Cancelled" if s["is_cancelled"] else FORMAT_LABELS[s["format"]]
 
 
 def going(signups: list[dict], session_id: int) -> list[dict]:
@@ -99,32 +101,38 @@ def money(x) -> str:
 def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -> None:
     st.markdown(
         "**Wednesdays 9:30–10:30pm at ComEd.** Pick every date you think you'll make it to "
-        "and update it here if plans change.\n\n"
-        "💵 **Pay at the session — pay what you can.** No need to pay ahead of time."
+        "and come back with the same email to update it if plans change.\n\n"
+        "**Pay at the session — pay what you can.** No need to pay ahead of time."
     )
     pay_note = st.secrets.get("PAYMENT_NOTE")
     if pay_note:
         st.caption(pay_note)
 
-    name = st.text_input("Your name (first + last initial is fine)", max_chars=60).strip()
-    if not name:
-        st.info("Enter your name to sign up or to edit your existing signups.")
+    email = st.text_input("Email", max_chars=120, placeholder="you@example.com").strip()
+    if not email:
+        st.info("Enter your email to sign up or to edit your existing signups.")
         return
-    key = player_key(name)
+    if not EMAIL_RE.match(email):
+        st.error("That doesn't look like an email address.")
+        return
+    key = email_key(email)
 
     mine = {r["session_id"]: r for r in signups if r["player_key"] == key}
     my_fb = next((f for f in feedback if f["player_key"] == key), None)
-    any_prev = next(iter(mine.values()), None)
-    if any_prev:
-        st.success(f"Welcome back — loaded your signups as **{any_prev['player_name']}**.")
+    prev = next(iter(mine.values()), None)
+    if prev:
+        st.success(f"Welcome back, {prev['player_name']} — your signups are loaded below.")
 
     with st.form(f"signup-{key}"):
-        contact = st.text_input(
-            "Slack handle (optional)", value=(any_prev or {}).get("contact") or ""
-        )
-        default_matchup = (any_prev or {}).get("matchup", "WMP")
+        name = st.text_input(
+            "Name", value=(prev or {}).get("player_name") or "", max_chars=60
+        ).strip()
+        default_matchup = (prev or {}).get("matchup")
         matchup = st.radio(
-            "Matchup", MATCHUPS, index=MATCHUPS.index(default_matchup), horizontal=True
+            "Gender match",
+            MATCHUPS,
+            index=MATCHUPS.index(default_matchup) if default_matchup in MATCHUPS else None,
+            horizontal=True,
         )
 
         st.markdown("**Which dates can you make?**")
@@ -133,19 +141,17 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
             existing = mine.get(s["id"])
             already_going = bool(existing and existing["status"] == "going")
             count = len(going(signups, s["id"]))
-            spots = ""
             if s["capacity"]:
                 spots = f" · {count}/{s['capacity']} spots"
                 full = count >= s["capacity"] and not already_going
             else:
                 spots = f" · {count} going"
                 full = False
-            locked = is_locked(s) or s["is_cancelled"]
             suffix = " (full)" if full else " (closed)" if is_locked(s) else ""
             picks[s["id"]] = st.checkbox(
                 f"{session_label(s)} — {format_badge(s)}{spots}{suffix}",
                 value=already_going,
-                disabled=locked or full,
+                disabled=is_locked(s) or s["is_cancelled"] or full,
                 key=f"pick-{key}-{s['id']}",
             )
 
@@ -166,7 +172,12 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
 
     if not submitted:
         return
-
+    if not name:
+        st.error("Please enter your name.")
+        return
+    if matchup is None:
+        st.error("Please pick WMP or MMP.")
+        return
     if matchup == "MMP":
         wmp_picked = [s for s in sessions if s["format"] == "wmp" and picks[s["id"]] and not is_locked(s)]
         if wmp_picked:
@@ -187,7 +198,7 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
                     "session_id": s["id"],
                     "player_name": name,
                     "player_key": key,
-                    "contact": contact.strip() or None,
+                    "contact": email,
                     "matchup": matchup,
                     "status": "going",
                 }
@@ -202,7 +213,10 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         s = next(x for x in sessions if x["id"] == row["session_id"])
         others = [r for r in going(fresh, s["id"]) if r["player_key"] != key]
         if s["capacity"] and len(others) >= s["capacity"]:
-            st.error(f"Sorry, {session_label(s)} just filled up. Your other dates were not saved yet — uncheck it and try again.")
+            st.error(
+                f"Sorry, {session_label(s)} just filled up. Nothing was saved — "
+                "uncheck it and try again."
+            )
             return
 
     client = db()
@@ -222,34 +236,30 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
     ).execute()
     refresh()
     n = len(upserts)
-    st.success(f"Saved! You're signed up for {n} date{'s' if n != 1 else ''}. See you on the court 🥏")
-    st.balloons()
+    st.success(f"Saved! You're signed up for {n} date{'s' if n != 1 else ''}. See you on the court.")
 
 
-# ── Roster tab ──────────────────────────────────────────────────────────────
+# ── Who's going tab ─────────────────────────────────────────────────────────
 def roster_tab(sessions: list[dict], signups: list[dict]) -> None:
     for s in sessions:
         roster = going(signups, s["id"])
-        counts = {m: sum(r["matchup"] == m for r in roster) for m in MATCHUPS}
-        title = f"{session_label(s)} — {format_badge(s)} · {len(roster)} going"
-        with st.expander(title, expanded=not is_locked(s) and s is next(
-            (x for x in sessions if not is_locked(x)), None
-        )):
-            if s["notes"]:
-                st.caption(s["notes"])
-            c1, c2, c3 = st.columns(3)
-            c1.metric("WMP", counts["WMP"])
-            c2.metric("MMP", counts["MMP"])
-            c3.metric("Either", counts["Either"])
+        with st.container(border=True):
+            st.markdown(f"#### {session_label(s)}")
+            st.caption(
+                f"{format_badge(s)} · {len(roster)} going"
+                + (f" · {s['notes']}" if s["notes"] else "")
+            )
+            cols = st.columns(2)
+            for col, m in zip(cols, MATCHUPS):
+                names = sorted((r["player_name"] for r in roster if r["matchup"] == m), key=str.lower)
+                with col:
+                    st.markdown(f"**{m}: {len(names)}**")
+                    st.markdown("\n".join(f"- {n}" for n in names) if names else "_No one yet_")
             if s["court_cost"] and roster:
                 st.caption(
-                    f"Court cost {money(s['court_cost'])} → about "
-                    f"**{money(float(s['court_cost']) / len(roster))}/person** if split evenly (PWYC)."
+                    f"Court cost {money(s['court_cost'])}, about "
+                    f"{money(float(s['court_cost']) / len(roster))}/person if split evenly (PWYC)."
                 )
-            if roster:
-                st.write(", ".join(f"{r['player_name']} ({r['matchup']})" for r in roster))
-            else:
-                st.write("_No one yet._")
 
 
 # ── Admin tab ───────────────────────────────────────────────────────────────
@@ -259,28 +269,27 @@ def format_planner(sessions: list[dict], signups: list[dict]) -> None:
     mixed_min = int(st.secrets.get("MIXED_MIN_EACH", 4))  # min of each matchup for a mixed night
     st.subheader("Format planner")
     st.caption(
-        f"Rule of thumb: WMP-only needs ≥ {wmp_min} WMP (4v4 + subs); mixed needs ≥ {mixed_min} of each. "
-        "'Either' players count toward whichever side is short. Change thresholds in secrets."
+        f"Rule of thumb: WMP-only needs at least {wmp_min} WMP (4v4 + subs); mixed needs at least "
+        f"{mixed_min} of each. Change thresholds in secrets."
     )
     out = []
     for s in sessions:
         r = going(signups, s["id"])
         w = sum(x["matchup"] == "WMP" for x in r)
         m = sum(x["matchup"] == "MMP" for x in r)
-        e = sum(x["matchup"] == "Either" for x in r)
         if s["is_cancelled"]:
             hint = "—"
-        elif w + e >= wmp_min and m + e < mixed_min:
+        elif w >= wmp_min and m < mixed_min:
             hint = "WMP-only (not enough MMP for mixed)"
-        elif w + e >= wmp_min:
+        elif w >= wmp_min:
             hint = "WMP-only possible"
-        elif min(w + e, m + e) >= mixed_min:
+        elif min(w, m) >= mixed_min:
             hint = "Mixed"
         else:
             hint = "Low numbers — recruit or combine"
         out.append(
             {"Date": session_label(s), "Set to": format_badge(s), "WMP": w, "MMP": m,
-             "Either": e, "Total": len(r), "Suggestion": hint}
+             "Total": len(r), "Suggestion": hint}
         )
     st.dataframe(pd.DataFrame(out), hide_index=True, width="stretch")
 
@@ -300,7 +309,11 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
     format_planner(sessions, signups)
     st.divider()
     labels = {s["id"]: f"{session_label(s)} — {format_badge(s)}" for s in sessions}
-    upcoming = next((s["id"] for s in sessions if datetime.now(TZ).date() <= date.fromisoformat(s["session_date"])), sessions[-1]["id"])
+    today = datetime.now(TZ).date()
+    upcoming = next(
+        (s["id"] for s in sessions if today <= date.fromisoformat(s["session_date"])),
+        sessions[-1]["id"],
+    )
     sid = st.selectbox(
         "Session", list(labels), index=list(labels).index(upcoming), format_func=labels.get
     )
@@ -334,21 +347,26 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
     st.subheader("Check-in & payments")
     if rows:
         df = pd.DataFrame(rows)[
-            ["id", "player_name", "matchup", "status", "is_walk_in", "attended", "paid", "amount_paid", "payment_method"]
+            ["id", "player_name", "contact", "matchup", "status", "is_walk_in",
+             "attended", "paid", "amount_paid", "payment_method"]
         ]
+        df["contact"] = df["contact"].fillna("")
         df["amount_paid"] = df["amount_paid"].astype(float)
         df["payment_method"] = df["payment_method"].fillna("")
-        df = df.sort_values(["status", "player_name"], key=lambda c: c.str.lower() if c.dtype == object else c)
+        df = df.sort_values(
+            ["status", "player_name"], key=lambda c: c.str.lower() if c.dtype == object else c
+        )
         edited = st.data_editor(
             df,
             key=f"editor-{sid}",
             hide_index=True,
             width="stretch",
-            disabled=["id", "player_name", "is_walk_in"],
+            disabled=["id", "player_name", "contact", "is_walk_in"],
             column_config={
                 "id": None,
                 "player_name": "Player",
-                "matchup": st.column_config.SelectboxColumn("Matchup", options=MATCHUPS),
+                "contact": "Email",
+                "matchup": st.column_config.SelectboxColumn("Match", options=MATCHUPS),
                 "status": st.column_config.SelectboxColumn("Status", options=["going", "cancelled"]),
                 "is_walk_in": st.column_config.CheckboxColumn("Walk-in"),
                 "attended": st.column_config.CheckboxColumn("Here"),
@@ -385,10 +403,11 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
     else:
         st.write("_No signups for this session yet._")
 
-    with st.expander("➕ Add a walk-in"):
+    with st.expander("Add a walk-in"):
         with st.form(f"walkin-{sid}", clear_on_submit=True):
             w_name = st.text_input("Name").strip()
-            w_match = st.radio("Matchup", MATCHUPS, horizontal=True)
+            w_email = st.text_input("Email (optional)").strip()
+            w_match = st.radio("Gender match", MATCHUPS, horizontal=True)
             w_amt = st.number_input("Amount paid", min_value=0.0, step=1.0)
             w_method = st.selectbox("Method", PAYMENT_METHODS)
             if st.form_submit_button("Add walk-in") and w_name:
@@ -396,7 +415,8 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
                     {
                         "session_id": sid,
                         "player_name": w_name,
-                        "player_key": player_key(w_name),
+                        "player_key": email_key(w_email) if w_email else f"walkin:{w_name.lower()}",
+                        "contact": w_email or None,
                         "matchup": w_match,
                         "status": "going",
                         "is_walk_in": True,
@@ -410,7 +430,7 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
                 refresh()
                 st.rerun()
 
-    with st.expander("⚙️ Session settings"):
+    with st.expander("Session settings"):
         with st.form(f"settings-{sid}"):
             fmt_keys = list(FORMAT_LABELS)
             new_fmt = st.radio(
@@ -421,7 +441,7 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
             new_cost = st.number_input(
                 "Court cost ($)", min_value=0.0, value=float(s["court_cost"] or 0), step=5.0
             )
-            new_notes = st.text_input("Note shown on roster", value=s["notes"] or "")
+            new_notes = st.text_input("Note shown on Who's going", value=s["notes"] or "")
             new_cancel = st.checkbox("Session cancelled", value=s["is_cancelled"])
             if st.form_submit_button("Save settings"):
                 client.table("mini_sessions").update(
@@ -443,19 +463,22 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
         date_by_id = {x["id"]: date.fromisoformat(x["session_date"]).strftime("%b %-d") for x in sessions}
         all_df["date"] = all_df["session_id"].map(date_by_id)
         active = all_df[all_df["status"] == "going"]
-        grid = active.pivot_table(index="player_name", columns="date", values="id", aggfunc="count", fill_value=0)
-        grid = grid.reindex(columns=[d for d in date_by_id.values() if d in grid.columns])
-        grid = grid.map(lambda v: "✅" if v else "") if hasattr(grid, "map") else grid.applymap(lambda v: "✅" if v else "")
-        paid = all_df.groupby("player_name")["amount_paid"].apply(lambda c: c.astype(float).sum())
-        grid["Dates"] = active.groupby("player_name").size()
-        grid["Paid total"] = paid.reindex(grid.index).fillna(0).map(money)
-        st.dataframe(grid, width="stretch")
+        if not active.empty:
+            grid = active.pivot_table(
+                index="player_name", columns="date", values="id", aggfunc="count", fill_value=0
+            )
+            grid = grid.reindex(columns=[d for d in date_by_id.values() if d in grid.columns])
+            grid = grid.map(lambda v: "x" if v else "")
+            paid = all_df.groupby("player_name")["amount_paid"].apply(lambda c: c.astype(float).sum())
+            grid["Dates"] = active.groupby("player_name").size()
+            grid["Paid total"] = paid.reindex(grid.index).fillna(0).map(money)
+            st.dataframe(grid, width="stretch")
         total = all_df["amount_paid"].astype(float).sum()
         cost = sum(float(x["court_cost"] or 0) for x in sessions if not x["is_cancelled"])
         st.caption(f"Collected all season: **{money(total)}**" + (f" of {money(cost)} court cost" if cost else ""))
         st.download_button(
             "Download all signups (CSV)",
-            all_df.drop(columns=["player_key"]).to_csv(index=False),
+            all_df.drop(columns=["player_key"]).rename(columns={"contact": "email"}).to_csv(index=False),
             file_name="mini_signups.csv",
             mime="text/csv",
         )
@@ -480,7 +503,7 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main() -> None:
-    st.title("🥏 Indoor Mini Signups")
+    st.title("Indoor Mini Signups")
     sessions, signups, feedback = load_sessions(), load_signups(), load_feedback()
     if not sessions:
         st.error("No sessions found — run supabase/schema.sql in your Supabase project first.")
