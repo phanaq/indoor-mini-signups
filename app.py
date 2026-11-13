@@ -100,13 +100,14 @@ def money(x) -> str:
 # ── Sign up tab ─────────────────────────────────────────────────────────────
 def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -> None:
     st.markdown(
-        "**Wednesdays 9:30–10:30pm at ComEd.** Pick every date you think you'll make it to "
-        "and come back with the same email to update it if plans change.\n\n"
-        "**Pay at the session — pay what you can.** No need to pay ahead of time."
+        "**When:** Wednesdays 9:30-10:30pm, Indoors at ComEd Rec Center.\n\n"
+        "Please mark all dates that you are available to attend so that I can convert some of "
+        "these dates from mixed to WMP only. You will be updated via email when the gender match "
+        "for each date is finalized.\n\n"
+        "1-2 dates will be converted to WMP only mini based on availability. The other dates "
+        "will be 2:2 mixed.\n\n"
+        "Suggested payment per session is $15 but pay what you can."
     )
-    pay_note = st.secrets.get("PAYMENT_NOTE")
-    if pay_note:
-        st.caption(pay_note)
 
     email = st.text_input("Email", max_chars=120, placeholder="you@example.com").strip()
     if not email:
@@ -155,16 +156,8 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
                 key=f"pick-{key}-{s['id']}",
             )
 
-        st.markdown("**Feedback:** some dates may be mixed and some WMP-only. What would you like?")
-        pref_keys = list(PREFERENCES)
-        default_pref = (my_fb or {}).get("preference", "some_of_each")
-        preference = st.radio(
-            "Format preference",
-            pref_keys,
-            index=pref_keys.index(default_pref),
-            format_func=PREFERENCES.get,
-            label_visibility="collapsed",
-        )
+        # The format-preference question was removed; keep any earlier answer, else store a neutral value.
+        preference = (my_fb or {}).get("preference", "no_preference")
         comments = st.text_area(
             "Anything else? (optional)", value=(my_fb or {}).get("comments") or "", max_chars=500
         )
@@ -483,18 +476,18 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
             mime="text/csv",
         )
 
-    st.subheader("Format feedback")
-    if feedback:
-        fb = pd.DataFrame(feedback)
-        tally = fb["preference"].map(PREFERENCES).value_counts()
-        st.bar_chart(tally, horizontal=True)
+    st.subheader("Player comments")
+    notes = [f for f in feedback if f.get("comments")]
+    if notes:
         st.dataframe(
-            fb.assign(preference=fb["preference"].map(PREFERENCES))[["player_name", "preference", "comments"]],
+            pd.DataFrame(notes)[["player_name", "comments"]].rename(
+                columns={"player_name": "Player", "comments": "Comment"}
+            ),
             hide_index=True,
             width="stretch",
         )
     else:
-        st.write("_No feedback yet._")
+        st.write("_No comments yet._")
 
     if st.button("Log out"):
         st.session_state.is_admin = False
