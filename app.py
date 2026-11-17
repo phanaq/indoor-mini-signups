@@ -30,10 +30,9 @@ PREFERENCES = {
 PAYMENT_METHODS = ["", "Venmo", "Zelle", "Cash", "PayPal", "Other"]
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# Spot rules (by signup order within each gender match)
-WMP_GUARANTEED = 5   # first N WMP always get a spot, whatever the format
-MIXED_PER_SIDE = 5   # mixed: first N WMP + first N MMP
-WMP_ONLY_SPOTS = 10  # WMP-only: first N WMP
+# Spot rules (by signup order within each gender match). Each session has a cap
+# (default 12): mixed = half WMP + half MMP, WMP-only = all WMP. Overflow is waitlisted.
+DEFAULT_CAP = 12
 SPOT_TEXT = {
     "spot": "You have a spot",
     "maybe": "Maybe: depends on whether this date ends up mixed or WMP-only",
@@ -100,6 +99,18 @@ def format_badge(s: dict) -> str:
     return "Cancelled" if s["is_cancelled"] else FORMAT_LABELS[s["format"]]
 
 
+FORMAT_TAG = {
+    "mixed": ":violet-background[**MIXED 2:2**]",
+    "wmp": ":green-background[**WMP ONLY**]",
+    "tbd": ":gray-background[**FORMAT TBD**]",
+}
+
+
+def format_tag(s: dict) -> str:
+    """Colored markdown tag so each week's format stands out."""
+    return ":red-background[**CANCELLED**]" if s["is_cancelled"] else FORMAT_TAG[s["format"]]
+
+
 def going(signups: list[dict], session_id: int) -> list[dict]:
     return [r for r in signups if r["session_id"] == session_id and r["status"] == "going"]
 
@@ -107,25 +118,70 @@ def going(signups: list[dict], session_id: int) -> list[dict]:
 def spot_status(s: dict, signups: list[dict]) -> dict[int, tuple[str, int | None]]:
     """Map signup id -> (status, waitlist position) for one session.
 
-    TBD:   first 5 WMP have a spot; everyone else is a maybe.
-    Mixed: first 5 WMP and first 5 MMP have a spot; the rest are waitlisted.
-    WMP:   first 10 WMP have a spot; the rest are waitlisted; MMP not eligible.
+    With cap C and half H = C // 2:
+    Mixed: first H WMP and first H MMP have a spot; the rest are waitlisted.
+    WMP:   first C WMP have a spot; the rest are waitlisted; MMP not eligible.
+    TBD:   first H WMP have a spot either way; WMP H+1..C and MMP 1..H are maybes;
+           anyone past that is waitlisted under both formats.
     """
+    cap, half = session_cap(s), session_cap(s) // 2
     roster = sorted(going(signups, s["id"]), key=lambda r: (r["created_at"], r["id"]))
     out: dict[int, tuple[str, int | None]] = {}
+    fmt = s["format"]
     for m in MATCHUPS:
         side = [r for r in roster if r["matchup"] == m]
         for rank, r in enumerate(side, start=1):
-            fmt = s["format"]
-            if fmt == "wmp" and m == "MMP":
-                out[r["id"]] = ("not_eligible", None)
-            elif fmt == "wmp":
-                out[r["id"]] = ("spot", None) if rank <= WMP_ONLY_SPOTS else ("waitlist", rank - WMP_ONLY_SPOTS)
+            if fmt == "wmp":
+                if m == "MMP":
+                    out[r["id"]] = ("not_eligible", None)
+                else:
+                    out[r["id"]] = ("spot", None) if rank <= cap else ("waitlist", rank - cap)
             elif fmt == "mixed":
-                out[r["id"]] = ("spot", None) if rank <= MIXED_PER_SIDE else ("waitlist", rank - MIXED_PER_SIDE)
-            else:  # tbd
-                out[r["id"]] = ("spot", None) if m == "WMP" and rank <= WMP_GUARANTEED else ("maybe", None)
+                out[r["id"]] = ("spot", None) if rank <= half else ("waitlist", rank - half)
+            elif m == "WMP":  # tbd
+                if rank <= half:
+                    out[r["id"]] = ("spot", None)
+                else:
+                    out[r["id"]] = ("maybe", None) if rank <= cap else ("waitlist", rank - cap)
+            else:  # tbd, MMP
+                out[r["id"]] = ("maybe", None) if rank <= half else ("waitlist", rank - half)
     return out
+
+
+def session_cap(s: dict) -> int:
+    return int(s.get("capacity") or DEFAULT_CAP)
+
+
+def typical_cap(sessions: list[dict]) -> int:
+    """Most common cap across upcoming sessions, for the signup page note."""
+    caps = [session_cap(s) for s in sessions if not is_locked(s) and not s["is_cancelled"]] or [DEFAULT_CAP]
+    return max(set(caps), key=caps.count)
+
+
+def spots_summary(s: dict, signups: list[dict]) -> str:
+    """Short 'spots taken' text for a session, e.g. 'WMP 4/6 · MMP 6/6'."""
+    r = going(signups, s["id"])
+    w = sum(x["matchup"] == "WMP" for x in r)
+    m = sum(x["matchup"] == "MMP" for x in r)
+    cap, half = session_cap(s), session_cap(s) // 2
+    if s["format"] == "wmp":
+        return f"WMP {min(w, cap)}/{cap}" + (f", {w - cap} waitlisted" if w > cap else "")
+    if s["format"] == "mixed":
+        wl = max(w - half, 0) + max(m - half, 0)
+        return f"WMP {min(w, half)}/{half} · MMP {min(m, half)}/{half}" + (f", {wl} waitlisted" if wl else "")
+    return f"{len(r)} signed up"
+
+
+def match_cap_text(s: dict, m: str) -> str:
+    """Cap for one gender match on a date, for the Who's going column headers."""
+    cap, half = session_cap(s), session_cap(s) // 2
+    if s["format"] == "mixed":
+        return f"Cap: {half} spots"
+    if s["format"] == "wmp":
+        return f"Cap: {cap} spots" if m == "WMP" else "Not open to MMP (WMP-only date)"
+    # tbd
+    return (f"Cap: {half} if mixed, {cap} if WMP only" if m == "WMP"
+            else f"Cap: {half} if mixed, 0 if WMP only")
 
 
 def spot_label(status: tuple[str, int | None]) -> str:
@@ -147,11 +203,13 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         "1-2 dates will be converted to WMP only mini based on availability. The other dates "
         "will be 2:2 mixed.\n\n"
         "Suggested payment per session is $15 but pay what you can.\n\n"
-        "**Spots:** each session is capped at 12 players, and spots go in signup order. "
-        f"The first {WMP_GUARANTEED} WMP always get a spot. On mixed dates, the first "
-        f"{MIXED_PER_SIDE} WMP and first {MIXED_PER_SIDE} MMP get a spot. On WMP-only dates, "
-        f"the first {WMP_ONLY_SPOTS} WMP get a spot. Until a date's format is set, everyone "
-        "else is a maybe."
+        f"**Spots:** each session is capped at {typical_cap(sessions)} players, and spots go in "
+        f"signup order. Mixed dates take {typical_cap(sessions) // 2} WMP and "
+        f"{typical_cap(sessions) // 2} MMP. WMP-only dates take {typical_cap(sessions)} WMP and "
+        f"are not open to MMP. Until a date's format is set, the first "
+        f"{typical_cap(sessions) // 2} WMP have a spot and the next few are maybes. "
+        "If a date is full, you can still sign up: you'll go on the waitlist, and there's no "
+        "limit to how many people can join it."
     )
 
     email = st.text_input("Email", max_chars=120, placeholder="you@example.com").strip()
@@ -167,37 +225,39 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
     my_fb = next((f for f in feedback if f["player_key"] == key), None)
     prev = next(iter(mine.values()), None)
 
-    with st.form(f"signup-{key}"):
-        name = st.text_input(
-            "Name", value=(prev or {}).get("player_name") or "", max_chars=60
-        ).strip()
-        default_matchup = (prev or {}).get("matchup")
-        matchup = st.radio(
-            "Gender match",
-            MATCHUPS,
-            index=MATCHUPS.index(default_matchup) if default_matchup in MATCHUPS else None,
-            horizontal=True,
-        )
+    # Name and match sit outside the form so the date list can react to the match choice.
+    name = st.text_input(
+        "Name", value=(prev or {}).get("player_name") or "", max_chars=60, key=f"name-{key}"
+    ).strip()
+    default_matchup = (prev or {}).get("matchup")
+    matchup = st.radio(
+        "Gender match",
+        MATCHUPS,
+        index=MATCHUPS.index(default_matchup) if default_matchup in MATCHUPS else None,
+        horizontal=True,
+        key=f"match-{key}",
+    )
 
+    with st.form(f"signup-{key}"):
         st.markdown("**Which dates can you make?**")
+        st.caption("Full dates are still open: you'll be added to the waitlist in signup order.")
         picks: dict[int, bool] = {}
         for s in sessions:
             existing = mine.get(s["id"])
             already_going = bool(existing and existing["status"] == "going")
-            count = len(going(signups, s["id"]))
-            if s["capacity"]:
-                spots = f" · {count}/{s['capacity']} spots"
-                full = count >= s["capacity"] and not already_going
-            else:
-                spots = f" · {count} going"
-                full = False
-            suffix = " (full)" if full else " (closed)" if is_locked(s) else ""
-            picks[s["id"]] = st.checkbox(
-                f"{session_label(s)} — {format_badge(s)}{spots}{suffix}",
+            mmp_blocked = matchup == "MMP" and s["format"] == "wmp"
+            suffix = (
+                " (closed)" if is_locked(s)
+                else " (WMP only, not open to MMP)" if mmp_blocked
+                else ""
+            )
+            picked = st.checkbox(
+                f"{format_tag(s)} {session_label(s)} · {spots_summary(s, signups)}{suffix}",
                 value=already_going,
-                disabled=is_locked(s) or s["is_cancelled"] or full,
+                disabled=is_locked(s) or s["is_cancelled"] or mmp_blocked,
                 key=f"pick-{key}-{s['id']}",
             )
+            picks[s["id"]] = picked and not mmp_blocked
 
         # The format-preference question was removed; keep any earlier answer, else store a neutral value.
         preference = (my_fb or {}).get("preference", "no_preference")
@@ -217,14 +277,6 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
     if matchup is None:
         st.error("Please pick WMP or MMP.")
         return
-    if matchup == "MMP":
-        wmp_picked = [s for s in sessions if s["format"] == "wmp" and picks[s["id"]] and not is_locked(s)]
-        if wmp_picked:
-            st.error(
-                "These dates are WMP-only — please uncheck them: "
-                + ", ".join(session_label(s) for s in wmp_picked)
-            )
-            return
 
     upserts, cancels = [], []
     for s in sessions:
@@ -246,19 +298,7 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         elif existing and existing["status"] == "going":
             cancels.append(existing["id"])
 
-    # Re-check capacity against fresh data to avoid oversubscribing.
-    load_signups.clear()
-    fresh = load_signups()
-    for row in upserts:
-        s = next(x for x in sessions if x["id"] == row["session_id"])
-        others = [r for r in going(fresh, s["id"]) if r["player_key"] != key]
-        if s["capacity"] and len(others) >= s["capacity"]:
-            st.error(
-                f"Sorry, {session_label(s)} just filled up. Nothing was saved — "
-                "uncheck it and try again."
-            )
-            return
-
+    # No hard cap: anyone past the cap is waitlisted (unlimited), see spot_status().
     client = db()
     if upserts:
         client.table("mini_signups").upsert(upserts, on_conflict="session_id,player_key").execute()
@@ -286,7 +326,7 @@ def my_status(sessions: list[dict], signups: list[dict], mine: dict[int, dict]) 
         if not r or r["status"] != "going":
             continue
         status = spot_status(s, signups).get(r["id"], ("maybe", None))
-        rows.append(f"- **{session_label(s)}** ({format_badge(s)}): {spot_label(status)}")
+        rows.append(f"- {format_tag(s)} **{session_label(s)}**: {spot_label(status)}")
     if rows:
         st.markdown("**Your spots**")
         st.markdown("\n".join(rows))
@@ -297,9 +337,9 @@ def roster_tab(sessions: list[dict], signups: list[dict]) -> None:
     for s in sessions:
         roster = going(signups, s["id"])
         with st.container(border=True):
-            st.markdown(f"#### {session_label(s)}")
+            st.markdown(f"#### {session_label(s)} &nbsp; {format_tag(s)}")
             st.caption(
-                f"{format_badge(s)} · {len(roster)} going"
+                f"{spots_summary(s, signups)}"
                 + (f" · {s['notes']}" if s["notes"] else "")
             )
             status = spot_status(s, signups)
@@ -315,7 +355,8 @@ def roster_tab(sessions: list[dict], signups: list[dict]) -> None:
                            "not_eligible": " (WMP-only date)"}[kind]
                     lines.append(f"- {r['player_name']}{tag}")
                 with col:
-                    st.markdown(f"**{m}: {len(side)}**")
+                    st.markdown(f"**{m}: {len(side)} signed up**")
+                    st.caption(match_cap_text(s, m))
                     st.markdown("\n".join(lines) if lines else "_No one yet_")
             if s["court_cost"] and roster:
                 st.caption(
@@ -502,7 +543,12 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
                 "Format", fmt_keys, index=fmt_keys.index(s["format"]),
                 format_func=FORMAT_LABELS.get, horizontal=True,
             )
-            new_cap = st.number_input("Capacity (0 = no cap)", min_value=0, value=s["capacity"] or 0, step=1)
+            new_cap = st.number_input(
+                "Max players (even number)",
+                min_value=2, max_value=40, step=2, value=session_cap(s),
+                help="Mixed dates split this evenly (12 = 6 WMP / 6 MMP, 10 = 5/5, 14 = 7/7). "
+                     "WMP-only dates take this many WMP. Anyone past the cap is waitlisted.",
+            )
             new_cost = st.number_input(
                 "Court cost ($)", min_value=0.0, value=float(s["court_cost"] or 0), step=5.0
             )
@@ -512,7 +558,7 @@ def admin_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -
                 client.table("mini_sessions").update(
                     {
                         "format": new_fmt,
-                        "capacity": int(new_cap) or None,
+                        "capacity": int(new_cap) // 2 * 2,  # keep it even
                         "court_cost": new_cost or None,
                         "notes": new_notes.strip() or None,
                         "is_cancelled": new_cancel,
