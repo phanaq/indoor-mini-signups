@@ -195,22 +195,22 @@ def money(x) -> str:
 
 # ── Sign up tab ─────────────────────────────────────────────────────────────
 def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) -> None:
-    st.markdown(
-        "**When:** Wednesdays 9:30-10:30pm, Indoors at ComEd Rec Center.\n\n"
-        "Please mark all dates that you are available to attend so that I can convert some of "
-        "these dates from mixed to WMP only. You will be updated via email when the gender match "
-        "for each date is finalized.\n\n"
-        "1-2 dates will be converted to WMP only mini based on availability. The other dates "
-        "will be 2:2 mixed.\n\n"
-        "Suggested payment per session is $15 but pay what you can.\n\n"
-        f"**Spots:** each session is capped at {typical_cap(sessions)} players, and spots go in "
-        f"signup order. Mixed dates take {typical_cap(sessions) // 2} WMP and "
-        f"{typical_cap(sessions) // 2} MMP. WMP-only dates take {typical_cap(sessions)} WMP and "
-        f"are not open to MMP. Until a date's format is set, the first "
-        f"{typical_cap(sessions) // 2} WMP have a spot and the next few are maybes. "
-        "If a date is full, you can still sign up: you'll go on the waitlist, and there's no "
-        "limit to how many people can join it."
-    )
+    def dates_for(fmt: str) -> str:
+        ds = [date.fromisoformat(s["session_date"]) for s in sessions
+              if s["format"] == fmt and not s["is_cancelled"]]
+        return ", ".join(f"{d.strftime('%B')} {d.day}" for d in ds)
+
+    lines = ["Wednesdays 9:30-10:30pm, Indoors at ComEd Rec Center.", ""]
+    for fmt, label in [("mixed", "Mixed dates"), ("wmp", "WMP only dates"), ("tbd", "Format TBD")]:
+        if dates_for(fmt):
+            lines.append(f"* {label}: {dates_for(fmt)}")
+    lines += [
+        "",
+        "Standard rate is $15/session, community rate is $10.",
+        "",
+        "If a date is full, you can still sign up for the waitlist in case people drop out last minute.",
+    ]
+    st.markdown("\n".join(lines))
 
     email = st.text_input("Email", max_chars=120, placeholder="you@example.com").strip()
     if not email:
