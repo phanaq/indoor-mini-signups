@@ -242,19 +242,20 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
         st.markdown("**Which dates can you make?**")
         st.caption("Full dates are still open: you'll be added to the waitlist in signup order.")
         picks: dict[int, bool] = {}
-        for s in sessions:
+        upcoming = [s for s in sessions if not is_locked(s)]
+        if len(upcoming) < len(sessions):
+            st.caption("Past dates are closed and no longer shown here.")
+        if not upcoming:
+            st.write("_No upcoming dates._")
+        for s in upcoming:
             existing = mine.get(s["id"])
             already_going = bool(existing and existing["status"] == "going")
             mmp_blocked = matchup == "MMP" and s["format"] == "wmp"
-            suffix = (
-                " (closed)" if is_locked(s)
-                else " (WMP only, not open to MMP)" if mmp_blocked
-                else ""
-            )
+            suffix = " (WMP only, not open to MMP)" if mmp_blocked else ""
             picked = st.checkbox(
                 f"{format_tag(s)} {session_label(s)} · {spots_summary(s, signups)}{suffix}",
                 value=already_going,
-                disabled=is_locked(s) or s["is_cancelled"] or mmp_blocked,
+                disabled=s["is_cancelled"] or mmp_blocked,
                 key=f"pick-{key}-{s['id']}",
             )
             picks[s["id"]] = picked and not mmp_blocked
@@ -280,7 +281,7 @@ def signup_tab(sessions: list[dict], signups: list[dict], feedback: list[dict]) 
 
     upserts, cancels = [], []
     for s in sessions:
-        if is_locked(s) or s["is_cancelled"]:
+        if is_locked(s) or s["is_cancelled"] or s["id"] not in picks:
             continue  # never touch past/cancelled sessions from the player side
         existing = mine.get(s["id"])
         if picks[s["id"]]:
@@ -323,7 +324,7 @@ def my_status(sessions: list[dict], signups: list[dict], mine: dict[int, dict]) 
     rows = []
     for s in sessions:
         r = mine.get(s["id"])
-        if not r or r["status"] != "going":
+        if is_locked(s) or not r or r["status"] != "going":
             continue
         status = spot_status(s, signups).get(r["id"], ("maybe", None))
         rows.append(f"- {format_tag(s)} **{session_label(s)}**: {spot_label(status)}")
@@ -336,8 +337,14 @@ def my_status(sessions: list[dict], signups: list[dict], mine: dict[int, dict]) 
 def roster_tab(sessions: list[dict], signups: list[dict]) -> None:
     for s in sessions:
         roster = going(signups, s["id"])
-        with st.container(border=True):
-            st.markdown(f"#### {session_label(s)} &nbsp; {format_tag(s)}")
+        past = is_locked(s)
+        box = (
+            st.expander(f"{session_label(s)} (past) · {format_badge(s)} · {len(roster)} signed up", expanded=False)
+            if past else st.container(border=True)
+        )
+        with box:
+            if not past:
+                st.markdown(f"#### {session_label(s)} &nbsp; {format_tag(s)}")
             st.caption(
                 f"{spots_summary(s, signups)}"
                 + (f" · {s['notes']}" if s["notes"] else "")
